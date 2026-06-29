@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -354,6 +355,11 @@ def build_application() -> Application:
 
 
 def main() -> None:
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     app = build_application()
     if WEBHOOK_URL:
         app.run_webhook(
