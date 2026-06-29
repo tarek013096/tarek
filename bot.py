@@ -132,18 +132,12 @@ def set_page_border(section) -> None:
 
     borders = OxmlElement("w:pgBorders")
     borders.set(qn("w:offsetFrom"), "page")
-    styles = {
-        "top": ("triple", "28", "167A8F"),
-        "bottom": ("triple", "28", "00B050"),
-        "left": ("thinThickThinMediumGap", "22", "167A8F"),
-        "right": ("thinThickThinMediumGap", "22", "00B050"),
-    }
-    for side, (style, size, color) in styles.items():
+    for side in ("top", "left", "bottom", "right"):
         border = OxmlElement(f"w:{side}")
-        border.set(qn("w:val"), style)
-        border.set(qn("w:sz"), size)
+        border.set(qn("w:val"), "thinThickThinMediumGap")
+        border.set(qn("w:sz"), "22")
         border.set(qn("w:space"), "18")
-        border.set(qn("w:color"), color)
+        border.set(qn("w:color"), "167A8F")
         borders.append(border)
     sect_pr.append(borders)
 
@@ -246,6 +240,7 @@ def add_centered_text(
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     paragraph.paragraph_format.space_after = Pt(space_after)
     add_text(paragraph, text, size=size, bold=bold, color=color, font=font)
+    return paragraph
 
 
 def add_spacer(document: Document, points: int) -> None:
@@ -253,29 +248,19 @@ def add_spacer(document: Document, points: int) -> None:
     paragraph.paragraph_format.space_after = Pt(points)
 
 
-def add_decorative_band(document: Document, left_color: str, right_color: str) -> None:
-    table = document.add_table(rows=1, cols=3)
-    table.autofit = False
-    widths = [2100, 5000, 2100]
-    fills = [left_color, "FFFFFF", right_color]
-    for index, cell in enumerate(table.rows[0].cells):
-        cell.text = ""
-        set_cell_width(cell, widths[index])
-        set_cell_shading(cell, fills[index])
-        clear_cell_border(cell)
-    paragraph = document.add_paragraph()
-    paragraph.paragraph_format.space_after = Pt(10)
-
-
 def add_course_line(document: Document, course_code: str, course_title: str) -> None:
     paragraph = document.add_paragraph()
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    paragraph.paragraph_format.left_indent = Cm(1.0)
+    paragraph.paragraph_format.right_indent = Cm(1.0)
     paragraph.paragraph_format.space_after = Pt(5)
     add_text(paragraph, "COURSE CODE: ", 13, True, RGBColor(0, 128, 64))
     add_text(paragraph, course_code, 13, True, RGBColor(20, 20, 20), "Aptos")
 
     title_paragraph = document.add_paragraph()
     title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_paragraph.paragraph_format.left_indent = Cm(1.0)
+    title_paragraph.paragraph_format.right_indent = Cm(1.0)
     title_paragraph.paragraph_format.space_after = Pt(20)
     add_text(title_paragraph, "COURSE TITLE: ", 13, True, RGBColor(0, 128, 64))
     add_text(title_paragraph, course_title, 13, True, RGBColor(20, 20, 20), "Aptos")
@@ -294,26 +279,42 @@ def fill_info_box(cell, heading: str, items: list[tuple[str, str, bool]]) -> Non
     set_cell_border(cell, "167A8F", "16", "single")
 
     heading_paragraph = cell.paragraphs[0]
-    heading_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    heading_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     heading_paragraph.paragraph_format.space_after = Pt(7)
     add_text(heading_paragraph, heading, 14, True, RGBColor(0, 128, 64), "Aptos Display")
 
     for label, value, show_label in items:
         paragraph = cell.add_paragraph()
         paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        paragraph.paragraph_format.left_indent = Cm(0.12)
+        paragraph.paragraph_format.right_indent = Cm(0.12)
         paragraph.paragraph_format.space_after = Pt(3)
         paragraph.paragraph_format.line_spacing = 1.0
         add_label_value(paragraph, label, value, show_label=show_label)
 
 
 def add_submission_boxes(document: Document, data: dict) -> None:
-    table = document.add_table(rows=1, cols=3)
+    wrapper = document.add_table(rows=1, cols=3)
+    wrapper.autofit = False
+    left_margin_cell = wrapper.cell(0, 0)
+    content_cell = wrapper.cell(0, 1)
+    right_margin_cell = wrapper.cell(0, 2)
+    for cell, width in ((left_margin_cell, 350), (content_cell, 8350), (right_margin_cell, 350)):
+        cell.text = ""
+        set_cell_width(cell, width)
+        clear_cell_border(cell)
+        set_cell_shading(cell, "F7FBFC")
+        if cell.paragraphs:
+            cell.paragraphs[0].paragraph_format.space_after = Pt(0)
+            cell.paragraphs[0].paragraph_format.space_before = Pt(0)
+
+    table = content_cell.add_table(rows=1, cols=3)
     table.autofit = False
     left_cell = table.cell(0, 0)
     gap_cell = table.cell(0, 1)
     right_cell = table.cell(0, 2)
 
-    for cell, width in ((left_cell, 4100), (gap_cell, 500), (right_cell, 4100)):
+    for cell, width in ((left_cell, 3900), (gap_cell, 550), (right_cell, 3900)):
         cell.text = ""
         set_cell_width(cell, width)
 
@@ -354,8 +355,10 @@ def create_cover_page(data: dict, logo_path: Path | None) -> Path:
     teal = RGBColor(22, 122, 143)
     dark = RGBColor(22, 31, 38)
 
-    add_decorative_band(document, "167A8F", "00B050")
-    add_centered_text(document, data["university_name"].upper(), 19, True, green, 8)
+    add_spacer(document, 8)
+    university_paragraph = add_centered_text(document, data["university_name"].upper(), 19, True, green, 8)
+    university_paragraph.paragraph_format.left_indent = Cm(0.7)
+    university_paragraph.paragraph_format.right_indent = Cm(0.7)
 
     if logo_path and logo_path.exists():
         logo_paragraph = document.add_paragraph()
@@ -377,7 +380,6 @@ def create_cover_page(data: dict, logo_path: Path | None) -> Path:
     add_spacer(document, 28)
     add_centered_text(document, "SUBMISSION DATE:", 15, True, green, 3)
     add_centered_text(document, data["submission_date"], 13, True, dark, 6, "Aptos")
-    add_decorative_band(document, "00B050", "167A8F")
 
     output_dir = Path(tempfile.gettempdir()) / "cover_page_bot"
     output_dir.mkdir(parents=True, exist_ok=True)
