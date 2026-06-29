@@ -12,6 +12,10 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Inches, Pt, RGBColor
+from reportlab.lib.colors import HexColor
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
 from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
@@ -338,54 +342,115 @@ def add_submission_boxes(document: Document, data: dict) -> None:
 
 
 def create_cover_page(data: dict, logo_path: Path | None) -> Path:
-    document = Document()
-    set_document_background(document)
-
-    section = document.sections[0]
-    section.page_width = Cm(21)
-    section.page_height = Cm(29.7)
-    section.top_margin = Cm(1.35)
-    section.bottom_margin = Cm(1.2)
-    section.left_margin = Cm(1.35)
-    section.right_margin = Cm(1.35)
-    section.start_type = WD_SECTION_START.NEW_PAGE
-    set_page_border(section)
-
-    green = RGBColor(0, 176, 80)
-    teal = RGBColor(22, 122, 143)
-    dark = RGBColor(22, 31, 38)
-
-    add_spacer(document, 8)
-    university_paragraph = add_centered_text(document, data["university_name"].upper(), 19, True, green, 8)
-    university_paragraph.paragraph_format.left_indent = Cm(0.7)
-    university_paragraph.paragraph_format.right_indent = Cm(0.7)
-
-    if logo_path and logo_path.exists():
-        logo_paragraph = document.add_paragraph()
-        logo_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        logo_paragraph.paragraph_format.space_after = Pt(15)
-        try:
-            logo_paragraph.add_run().add_picture(str(logo_path), width=Inches(1.35))
-        except Exception:
-            LOGGER.exception("Could not insert uploaded logo")
-    else:
-        add_spacer(document, 34)
-
-    title = "LAB REPORT" if data["document_type"] == "lab" else "ASSIGNMENT"
-    add_centered_text(document, title, 27, True, teal, 8)
-    add_centered_text(document, f"{title.title()} No: {data['work_no']}", 15, True, dark, 14, "Aptos")
-    add_course_line(document, data["course_code"], data["course_title"])
-    add_submission_boxes(document, data)
-
-    add_spacer(document, 28)
-    add_centered_text(document, "SUBMISSION DATE:", 15, True, green, 3)
-    add_centered_text(document, data["submission_date"], 13, True, dark, 6, "Aptos")
-
     output_dir = Path(tempfile.gettempdir()) / "cover_page_bot"
     output_dir.mkdir(parents=True, exist_ok=True)
+    title = "LAB REPORT" if data["document_type"] == "lab" else "ASSIGNMENT"
     base_name = clean_filename(f"{title.lower()}_{data['student_id']}_{data['work_no']}")
-    output_path = output_dir / f"{base_name}.docx"
-    document.save(output_path)
+    output_path = output_dir / f"{base_name}.pdf"
+
+    page_width, page_height = A4
+    pdf = canvas.Canvas(str(output_path), pagesize=A4)
+
+    green = HexColor("#00A651")
+    teal = HexColor("#167A8F")
+    dark = HexColor("#15222A")
+    light_bg = HexColor("#F7FBFC")
+    soft_box = HexColor("#F1FAF7")
+
+    pdf.setFillColor(light_bg)
+    pdf.rect(0, 0, page_width, page_height, stroke=0, fill=1)
+
+    for offset, line_width in ((26, 2.2), (32, 0.8)):
+        pdf.setStrokeColor(teal)
+        pdf.setLineWidth(line_width)
+        pdf.rect(offset, offset, page_width - (offset * 2), page_height - (offset * 2), stroke=1, fill=0)
+
+    def center_text(text: str, y: float, size: int, color=dark, font="Helvetica-Bold", max_width: float | None = None) -> None:
+        fitted_size = size
+        if max_width:
+            while fitted_size > 9 and pdf.stringWidth(text, font, fitted_size) > max_width:
+                fitted_size -= 1
+        pdf.setFont(font, fitted_size)
+        pdf.setFillColor(color)
+        pdf.drawCentredString(page_width / 2, y, text)
+
+    center_text(data["university_name"].upper(), 775, 20, green, max_width=page_width - 90)
+
+    if logo_path and logo_path.exists():
+        try:
+            image = ImageReader(str(logo_path))
+            pdf.drawImage(image, (page_width - 82) / 2, 675, width=82, height=82, preserveAspectRatio=True, mask="auto")
+        except Exception:
+            LOGGER.exception("Could not insert uploaded logo into PDF")
+
+    center_text(title, 620, 32, teal)
+    center_text(f"{title.title()} No: {data['work_no']}", 588, 18, dark, max_width=page_width - 120)
+
+    center_text(f"COURSE CODE: {data['course_code']}", 546, 16, dark, max_width=page_width - 120)
+    center_text(f"COURSE TITLE: {data['course_title']}", 520, 16, dark, max_width=page_width - 120)
+    pdf.setStrokeColor(teal)
+    pdf.setLineWidth(1.6)
+    pdf.line(95, 500, page_width - 95, 500)
+
+    box_width = 250
+    box_height = 190
+    gap = 20
+    total_width = (box_width * 2) + gap
+    left_x = (page_width - total_width) / 2
+    right_x = left_x + box_width + gap
+    box_y = 260
+
+    def draw_box(x: float, heading: str, rows: list[tuple[str, str, bool]]) -> None:
+        pdf.setFillColor(soft_box)
+        pdf.setStrokeColor(teal)
+        pdf.setLineWidth(1.6)
+        pdf.roundRect(x, box_y, box_width, box_height, 9, stroke=1, fill=1)
+
+        pdf.setFillColor(green)
+        pdf.setFont("Helvetica-Bold", 16)
+        pdf.drawCentredString(x + (box_width / 2), box_y + box_height - 34, heading)
+
+        y = box_y + box_height - 70
+        for label, value, show_label in rows:
+            pdf.setFillColor(green)
+            pdf.setFont("Helvetica-Bold", 13)
+            if show_label:
+                pdf.drawString(x + 20, y, label)
+                label_width = pdf.stringWidth(label, "Helvetica-Bold", 13)
+                value_x = x + 20 + label_width + 2
+            else:
+                value_x = x + 20
+
+            pdf.setFillColor(dark)
+            pdf.setFont("Helvetica-Bold", 13)
+            pdf.drawString(value_x, y, value[:32])
+            y -= 31
+
+    draw_box(
+        left_x,
+        "SUBMITTED BY:",
+        [
+            ("NAME: ", data["student_name"], True),
+            ("ID: ", data["student_id"], True),
+            ("PROGRAM: ", data["program"], True),
+            ("", data["batch_year_semester"], False),
+        ],
+    )
+    draw_box(
+        right_x,
+        "SUBMITTED TO:",
+        [
+            ("NAME: ", data["teacher_name"], True),
+            ("DESIGNATION: ", data["teacher_designation"], True),
+            ("DEPARTMENT: ", data["teacher_department"], True),
+        ],
+    )
+
+    center_text("SUBMISSION DATE:", 150, 17, green)
+    center_text(data["submission_date"], 123, 16, dark, max_width=page_width - 140)
+
+    pdf.showPage()
+    pdf.save()
     return output_path
 
 
@@ -532,7 +597,7 @@ async def collect_logo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             chat_id=update.effective_chat.id,
             document=document_file,
             filename=output_path.name,
-            caption="Cover page ready. DOCX file ta download kore nin.",
+            caption="Cover page ready. PDF file ta download kore nin.",
             reply_markup=MAIN_KEYBOARD,
         )
     remember_message(context, sent_doc.message_id)
