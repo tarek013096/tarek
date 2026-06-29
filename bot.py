@@ -3,21 +3,18 @@ import logging
 import os
 import re
 import tempfile
-from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from docx import Document
 from docx.enum.section import WD_SECTION_START
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.shared import Cm, Inches, Pt, RGBColor
-from telegram import (
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    Update,
-)
+from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -38,12 +35,28 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 
-MENU_KEYBOARD = ReplyKeyboardMarkup(
+LAB_BUTTON = "Lab Report Generator"
+ASSIGNMENT_BUTTON = "Assignment Generator"
+BACK_BUTTON = "Back"
+CLEAR_BUTTON = "Clear"
+CANCEL_BUTTON = "Cancel"
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("Lab Report Generator")],
-        [KeyboardButton("Assignment Generator")],
+        [KeyboardButton(LAB_BUTTON), KeyboardButton(ASSIGNMENT_BUTTON)],
+        [KeyboardButton(CLEAR_BUTTON)],
     ],
     resize_keyboard=True,
+    one_time_keyboard=False,
+)
+
+FORM_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton(BACK_BUTTON), KeyboardButton(CLEAR_BUTTON)],
+        [KeyboardButton(CANCEL_BUTTON)],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=False,
 )
 
 FIELDS = [
@@ -58,6 +71,7 @@ FIELDS = [
     ("teacher_name", "Teacher er name likhun:"),
     ("teacher_designation", "Teacher er designation likhun:"),
     ("teacher_department", "Teacher er department likhun:"),
+    ("submission_date", "Submission date likhun, example: June 29, 2026"),
 ]
 
 ASK_FIELD, ASK_LOGO = range(2)
@@ -68,9 +82,155 @@ def clean_filename(value: str) -> str:
     return value[:70] or "cover-page"
 
 
-def add_spacer(document: Document, points: int) -> None:
-    paragraph = document.add_paragraph()
-    paragraph.paragraph_format.space_after = Pt(points)
+def remember_message(context: ContextTypes.DEFAULT_TYPE, message_id: int | None) -> None:
+    if not message_id:
+        return
+    ids = context.chat_data.setdefault("message_ids", [])
+    if message_id not in ids:
+        ids.append(message_id)
+
+
+async def send_tracked(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
+    message = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        reply_markup=reply_markup,
+    )
+    remember_message(context, message.message_id)
+    return message
+
+
+async def track_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_message:
+        remember_message(context, update.effective_message.message_id)
+
+
+async def delete_tracked_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    message_ids = list(context.chat_data.get("message_ids", []))
+    context.chat_data["message_ids"] = []
+    for message_id in message_ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramError:
+            pass
+
+
+def set_document_background(document: Document, color: str = "F7FBFC") -> None:
+    background = document._element.find(qn("w:background"))
+    if background is None:
+        background = OxmlElement("w:background")
+        document._element.insert(0, background)
+    background.set(qn("w:color"), color)
+
+
+def set_page_border(section) -> None:
+    sect_pr = section._sectPr
+    existing = sect_pr.find(qn("w:pgBorders"))
+    if existing is not None:
+        sect_pr.remove(existing)
+
+    borders = OxmlElement("w:pgBorders")
+    borders.set(qn("w:offsetFrom"), "page")
+    styles = {
+        "top": ("triple", "28", "167A8F"),
+        "bottom": ("triple", "28", "00B050"),
+        "left": ("thinThickThinMediumGap", "22", "167A8F"),
+        "right": ("thinThickThinMediumGap", "22", "00B050"),
+    }
+    for side, (style, size, color) in styles.items():
+        border = OxmlElement(f"w:{side}")
+        border.set(qn("w:val"), style)
+        border.set(qn("w:sz"), size)
+        border.set(qn("w:space"), "18")
+        border.set(qn("w:color"), color)
+        borders.append(border)
+    sect_pr.append(borders)
+
+
+def set_cell_width(cell, width_twips: int) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    width = tc_pr.find(qn("w:tcW"))
+    if width is None:
+        width = OxmlElement("w:tcW")
+        tc_pr.append(width)
+    width.set(qn("w:w"), str(width_twips))
+    width.set(qn("w:type"), "dxa")
+
+
+def set_cell_shading(cell, fill: str) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shading = tc_pr.find(qn("w:shd"))
+    if shading is None:
+        shading = OxmlElement("w:shd")
+        tc_pr.append(shading)
+    shading.set(qn("w:fill"), fill)
+
+
+def set_cell_border(cell, color: str = "167A8F", size: str = "14", style: str = "single") -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    borders = tc_pr.find(qn("w:tcBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tcBorders")
+        tc_pr.append(borders)
+
+    for side in ("top", "left", "bottom", "right"):
+        border = borders.find(qn(f"w:{side}"))
+        if border is None:
+            border = OxmlElement(f"w:{side}")
+            borders.append(border)
+        border.set(qn("w:val"), style)
+        border.set(qn("w:sz"), size)
+        border.set(qn("w:space"), "0")
+        border.set(qn("w:color"), color)
+
+
+def clear_cell_border(cell) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    borders = tc_pr.find(qn("w:tcBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tcBorders")
+        tc_pr.append(borders)
+
+    for side in ("top", "left", "bottom", "right"):
+        border = borders.find(qn(f"w:{side}"))
+        if border is None:
+            border = OxmlElement(f"w:{side}")
+            borders.append(border)
+        border.set(qn("w:val"), "nil")
+
+
+def set_paragraph_bottom_border(paragraph, color: str = "167A8F") -> None:
+    p_pr = paragraph._p.get_or_add_pPr()
+    p_bdr = p_pr.find(qn("w:pBdr"))
+    if p_bdr is None:
+        p_bdr = OxmlElement("w:pBdr")
+        p_pr.append(p_bdr)
+    bottom = p_bdr.find(qn("w:bottom"))
+    if bottom is None:
+        bottom = OxmlElement("w:bottom")
+        p_bdr.append(bottom)
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "18")
+    bottom.set(qn("w:space"), "8")
+    bottom.set(qn("w:color"), color)
+
+
+def add_text(
+    paragraph,
+    text: str,
+    size: int,
+    bold: bool = False,
+    color: RGBColor | None = None,
+    font: str = "Aptos Display",
+):
+    run = paragraph.add_run(text)
+    run.bold = bold
+    run.font.name = font
+    run.font.size = Pt(size)
+    if color:
+        run.font.color.rgb = color
+    return run
 
 
 def add_centered_text(
@@ -80,134 +240,144 @@ def add_centered_text(
     bold: bool = False,
     color: RGBColor | None = None,
     space_after: int = 6,
+    font: str = "Aptos Display",
 ) -> None:
     paragraph = document.add_paragraph()
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     paragraph.paragraph_format.space_after = Pt(space_after)
-    run = paragraph.add_run(text)
-    run.bold = bold
-    run.font.name = "Times New Roman"
-    run.font.size = Pt(size)
-    if color:
-        run.font.color.rgb = color
+    add_text(paragraph, text, size=size, bold=bold, color=color, font=font)
 
 
-def add_label_value(paragraph, label: str, value: str) -> None:
-    label_run = paragraph.add_run(label)
-    label_run.bold = True
-    label_run.font.name = "Times New Roman"
-    label_run.font.color.rgb = RGBColor(0, 128, 64)
-
-    value_run = paragraph.add_run(value)
-    value_run.bold = True
-    value_run.font.name = "Times New Roman"
-    value_run.font.color.rgb = RGBColor(0, 0, 0)
+def add_spacer(document: Document, points: int) -> None:
+    paragraph = document.add_paragraph()
+    paragraph.paragraph_format.space_after = Pt(points)
 
 
-def add_info_box(document: Document, heading: str, items: list[tuple[str, str]]) -> None:
-    table = document.add_table(rows=1, cols=1)
-    table.autofit = True
-    cell = table.cell(0, 0)
-    cell.text = ""
+def add_decorative_band(document: Document, left_color: str, right_color: str) -> None:
+    table = document.add_table(rows=1, cols=3)
+    table.autofit = False
+    widths = [2100, 5000, 2100]
+    fills = [left_color, "FFFFFF", right_color]
+    for index, cell in enumerate(table.rows[0].cells):
+        cell.text = ""
+        set_cell_width(cell, widths[index])
+        set_cell_shading(cell, fills[index])
+        clear_cell_border(cell)
+    paragraph = document.add_paragraph()
+    paragraph.paragraph_format.space_after = Pt(10)
+
+
+def add_course_line(document: Document, course_code: str, course_title: str) -> None:
+    paragraph = document.add_paragraph()
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    paragraph.paragraph_format.space_after = Pt(5)
+    add_text(paragraph, "COURSE CODE: ", 13, True, RGBColor(0, 128, 64))
+    add_text(paragraph, course_code, 13, True, RGBColor(20, 20, 20), "Aptos")
+
+    title_paragraph = document.add_paragraph()
+    title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_paragraph.paragraph_format.space_after = Pt(20)
+    add_text(title_paragraph, "COURSE TITLE: ", 13, True, RGBColor(0, 128, 64))
+    add_text(title_paragraph, course_title, 13, True, RGBColor(20, 20, 20), "Aptos")
+    set_paragraph_bottom_border(title_paragraph)
+
+
+def add_label_value(paragraph, label: str, value: str, show_label: bool = True) -> None:
+    if show_label:
+        add_text(paragraph, label, 10, True, RGBColor(0, 128, 64), "Aptos")
+    add_text(paragraph, value, 10, True, RGBColor(22, 31, 38), "Aptos")
+
+
+def fill_info_box(cell, heading: str, items: list[tuple[str, str, bool]]) -> None:
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+    set_cell_shading(cell, "F1FAF7")
+    set_cell_border(cell, "167A8F", "16", "single")
 
     heading_paragraph = cell.paragraphs[0]
-    heading_paragraph.paragraph_format.space_after = Pt(4)
-    heading_run = heading_paragraph.add_run(heading)
-    heading_run.bold = True
-    heading_run.font.name = "Times New Roman"
-    heading_run.font.size = Pt(16)
-    heading_run.font.color.rgb = RGBColor(0, 128, 64)
+    heading_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    heading_paragraph.paragraph_format.space_after = Pt(7)
+    add_text(heading_paragraph, heading, 14, True, RGBColor(0, 128, 64), "Aptos Display")
 
-    for label, value in items:
+    for label, value, show_label in items:
         paragraph = cell.add_paragraph()
-        paragraph.paragraph_format.space_after = Pt(1)
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        paragraph.paragraph_format.space_after = Pt(3)
         paragraph.paragraph_format.line_spacing = 1.0
-        add_label_value(paragraph, label, value)
+        add_label_value(paragraph, label, value, show_label=show_label)
+
+
+def add_submission_boxes(document: Document, data: dict) -> None:
+    table = document.add_table(rows=1, cols=3)
+    table.autofit = False
+    left_cell = table.cell(0, 0)
+    gap_cell = table.cell(0, 1)
+    right_cell = table.cell(0, 2)
+
+    for cell, width in ((left_cell, 4100), (gap_cell, 500), (right_cell, 4100)):
+        cell.text = ""
+        set_cell_width(cell, width)
+
+    clear_cell_border(gap_cell)
+    set_cell_shading(gap_cell, "F7FBFC")
+
+    submitted_by = [
+        ("NAME: ", data["student_name"], True),
+        ("ID: ", data["student_id"], True),
+        ("PROGRAM: ", data["program"], True),
+        ("", data["batch_year_semester"], False),
+    ]
+    submitted_to = [
+        ("NAME: ", data["teacher_name"], True),
+        ("DESIGNATION: ", data["teacher_designation"], True),
+        ("DEPARTMENT: ", data["teacher_department"], True),
+    ]
+
+    fill_info_box(left_cell, "SUBMITTED BY:", submitted_by)
+    fill_info_box(right_cell, "SUBMITTED TO:", submitted_to)
 
 
 def create_cover_page(data: dict, logo_path: Path | None) -> Path:
     document = Document()
+    set_document_background(document)
 
     section = document.sections[0]
     section.page_width = Cm(21)
     section.page_height = Cm(29.7)
-    section.top_margin = Cm(1.27)
-    section.bottom_margin = Cm(1.27)
-    section.left_margin = Cm(1.27)
-    section.right_margin = Cm(1.27)
+    section.top_margin = Cm(1.35)
+    section.bottom_margin = Cm(1.2)
+    section.left_margin = Cm(1.35)
+    section.right_margin = Cm(1.35)
     section.start_type = WD_SECTION_START.NEW_PAGE
+    set_page_border(section)
 
     green = RGBColor(0, 176, 80)
-    accent = RGBColor(22, 122, 143)
+    teal = RGBColor(22, 122, 143)
+    dark = RGBColor(22, 31, 38)
 
-    add_centered_text(
-        document,
-        data["university_name"].upper(),
-        size=20,
-        bold=True,
-        color=green,
-        space_after=10,
-    )
+    add_decorative_band(document, "167A8F", "00B050")
+    add_centered_text(document, data["university_name"].upper(), 19, True, green, 8)
 
     if logo_path and logo_path.exists():
         logo_paragraph = document.add_paragraph()
         logo_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        logo_run = logo_paragraph.add_run()
+        logo_paragraph.paragraph_format.space_after = Pt(15)
         try:
-            logo_run.add_picture(str(logo_path), width=Inches(1.45))
+            logo_paragraph.add_run().add_picture(str(logo_path), width=Inches(1.35))
         except Exception:
             LOGGER.exception("Could not insert uploaded logo")
-        logo_paragraph.paragraph_format.space_after = Pt(18)
     else:
-        add_spacer(document, 36)
+        add_spacer(document, 34)
 
     title = "LAB REPORT" if data["document_type"] == "lab" else "ASSIGNMENT"
-    add_centered_text(document, title, size=26, bold=True, color=accent, space_after=12)
-    add_centered_text(
-        document,
-        f"{title.title()} No: {data['work_no']}",
-        size=16,
-        bold=True,
-        color=RGBColor(0, 0, 0),
-        space_after=18,
-    )
+    add_centered_text(document, title, 27, True, teal, 8)
+    add_centered_text(document, f"{title.title()} No: {data['work_no']}", 15, True, dark, 14, "Aptos")
+    add_course_line(document, data["course_code"], data["course_title"])
+    add_submission_boxes(document, data)
 
-    course = document.add_paragraph()
-    course.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    add_label_value(course, "COURSE CODE: ", data["course_code"])
-    course.paragraph_format.space_after = Pt(4)
-
-    course_title = document.add_paragraph()
-    course_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    add_label_value(course_title, "COURSE TITLE: ", data["course_title"])
-    course_title.paragraph_format.space_after = Pt(24)
-
-    box_table = document.add_table(rows=1, cols=2)
-    box_table.autofit = True
-    left_cell = box_table.cell(0, 0)
-    right_cell = box_table.cell(0, 1)
-    left_cell.text = ""
-    right_cell.text = ""
-
-    submitted_to = [
-        ("NAME: ", data["teacher_name"]),
-        ("DESIGNATION: ", data["teacher_designation"]),
-        ("DEPARTMENT: ", data["teacher_department"]),
-    ]
-    submitted_by = [
-        ("NAME: ", data["student_name"]),
-        ("ID: ", data["student_id"]),
-        ("PROGRAM: ", data["program"]),
-        ("BATCH/YEAR/SEMESTER: ", data["batch_year_semester"]),
-    ]
-
-    fill_cell_box(left_cell, "SUBMITTED TO:", submitted_to)
-    fill_cell_box(right_cell, "SUBMITTED BY:", submitted_by)
-
-    add_spacer(document, 32)
-    add_centered_text(document, "SUBMISSION DATE:", size=16, bold=True, color=green, space_after=4)
-    today = datetime.now(ZoneInfo("Asia/Dhaka")).strftime("%B %d, %Y")
-    add_centered_text(document, today, size=14, bold=True, color=RGBColor(0, 0, 0), space_after=0)
+    add_spacer(document, 28)
+    add_centered_text(document, "SUBMISSION DATE:", 15, True, green, 3)
+    add_centered_text(document, data["submission_date"], 13, True, dark, 6, "Aptos")
+    add_decorative_band(document, "00B050", "167A8F")
 
     output_dir = Path(tempfile.gettempdir()) / "cover_page_bot"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -217,111 +387,171 @@ def create_cover_page(data: dict, logo_path: Path | None) -> Path:
     return output_path
 
 
-def fill_cell_box(cell, heading: str, items: list[tuple[str, str]]) -> None:
-    heading_paragraph = cell.paragraphs[0]
-    heading_paragraph.paragraph_format.space_after = Pt(6)
-    heading_run = heading_paragraph.add_run(heading)
-    heading_run.bold = True
-    heading_run.font.name = "Times New Roman"
-    heading_run.font.size = Pt(16)
-    heading_run.font.color.rgb = RGBColor(0, 176, 80)
-
-    for label, value in items:
-        paragraph = cell.add_paragraph()
-        paragraph.paragraph_format.space_after = Pt(2)
-        add_label_value(paragraph, label, value)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+def reset_form(context: ContextTypes.DEFAULT_TYPE, document_type: str | None = None) -> None:
     context.user_data.clear()
-    await update.message.reply_text(
-        "Cover page generator ready. Nicher menu theke ekta option choose korun.",
-        reply_markup=MENU_KEYBOARD,
-    )
+    if document_type:
+        context.user_data["document_type"] = document_type
+        context.user_data["field_index"] = 0
+
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    await send_tracked(update, context, text, MAIN_KEYBOARD)
     return ConversationHandler.END
 
 
-async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip().lower()
-    if "lab" in text:
-        context.user_data["document_type"] = "lab"
-    elif "assignment" in text:
-        context.user_data["document_type"] = "assignment"
-    else:
-        await update.message.reply_text("Menu theke Lab Report Generator ba Assignment Generator choose korun.")
-        return ConversationHandler.END
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await track_incoming(update, context)
+    reset_form(context)
+    return await show_main_menu(
+        update,
+        context,
+        "Cover page bot ready. Menu theke Lab Report ba Assignment choose korun.",
+    )
 
-    context.user_data["field_index"] = 0
-    await update.message.reply_text(FIELDS[0][1], reply_markup=ReplyKeyboardRemove())
+
+async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await track_incoming(update, context)
+    reset_form(context)
+    await delete_tracked_messages(update, context)
+    message = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="Cleared. Notun kore start korte menu use korun.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+    remember_message(context, message.message_id)
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await track_incoming(update, context)
+    reset_form(context)
+    return await show_main_menu(update, context, "Generation cancel kora hoyeche. Menu theke abar choose korun.")
+
+
+async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await track_incoming(update, context)
+    text = update.effective_message.text.strip()
+    if text == LAB_BUTTON:
+        reset_form(context, "lab")
+    elif text == ASSIGNMENT_BUTTON:
+        reset_form(context, "assignment")
+    else:
+        return await show_main_menu(update, context, "Menu theke valid option choose korun.")
+
+    await send_tracked(update, context, FIELDS[0][1], FORM_KEYBOARD)
+    return ASK_FIELD
+
+
+async def back_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await track_incoming(update, context)
+    field_index = int(context.user_data.get("field_index", 0))
+    if field_index <= 0:
+        await send_tracked(update, context, "Eita prothom step. Menu theke notun option choose korte paren.", FORM_KEYBOARD)
+        return ASK_FIELD
+
+    field_index -= 1
+    field_name, prompt = FIELDS[field_index]
+    context.user_data.pop(field_name, None)
+    context.user_data["field_index"] = field_index
+    await send_tracked(update, context, f"Back kora holo. {prompt}", FORM_KEYBOARD)
     return ASK_FIELD
 
 
 async def collect_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    field_index = context.user_data.get("field_index", 0)
-    field_name, _ = FIELDS[field_index]
-    value = update.message.text.strip()
+    await track_incoming(update, context)
+    text = update.effective_message.text.strip()
 
-    if not value:
-        await update.message.reply_text("Ei field ta khali rakha jabe na. Abar likhun:")
+    if text in {LAB_BUTTON, ASSIGNMENT_BUTTON}:
+        return await choose_type(update, context)
+
+    field_index = int(context.user_data.get("field_index", 0))
+    field_name, _ = FIELDS[field_index]
+
+    if not text:
+        await send_tracked(update, context, "Ei field ta khali rakha jabe na. Abar likhun:", FORM_KEYBOARD)
         return ASK_FIELD
 
-    context.user_data[field_name] = value
+    context.user_data[field_name] = text
     field_index += 1
     context.user_data["field_index"] = field_index
 
     if field_index < len(FIELDS):
-        await update.message.reply_text(FIELDS[field_index][1])
+        await send_tracked(update, context, FIELDS[field_index][1], FORM_KEYBOARD)
         return ASK_FIELD
 
-    await update.message.reply_text(
-        "University logo upload korun. Photo hisebe pathate paren, ba image file document hisebe pathate paren."
+    await send_tracked(
+        update,
+        context,
+        "University logo upload korun. Photo hisebe ba image document hisebe pathan.",
+        FORM_KEYBOARD,
     )
     return ASK_LOGO
 
 
+async def back_from_logo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await track_incoming(update, context)
+    context.user_data["field_index"] = len(FIELDS) - 1
+    context.user_data.pop("submission_date", None)
+    await send_tracked(update, context, f"Back kora holo. {FIELDS[-1][1]}", FORM_KEYBOARD)
+    return ASK_FIELD
+
+
 async def collect_logo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+    await track_incoming(update, context)
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
 
     logo_path = None
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
+    file_id = None
+    if update.effective_message.photo:
+        file_id = update.effective_message.photo[-1].file_id
         logo_path = Path(tempfile.gettempdir()) / f"logo_{update.effective_user.id}.jpg"
-    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
-        file_id = update.message.document.file_id
-        extension = Path(update.message.document.file_name or "logo.png").suffix or ".png"
+    elif update.effective_message.document and (update.effective_message.document.mime_type or "").startswith("image/"):
+        file_id = update.effective_message.document.file_id
+        extension = Path(update.effective_message.document.file_name or "logo.png").suffix or ".png"
         logo_path = Path(tempfile.gettempdir()) / f"logo_{update.effective_user.id}{extension}"
-    else:
-        await update.message.reply_text("Please ekta image/logo upload korun.")
+
+    if not file_id or not logo_path:
+        await send_tracked(update, context, "Logo hisebe ekta image upload korun. Vul hole Back click korun.", FORM_KEYBOARD)
         return ASK_LOGO
 
     telegram_file = await context.bot.get_file(file_id)
     await telegram_file.download_to_drive(custom_path=str(logo_path))
 
-    output_path = create_cover_page(dict(context.user_data), logo_path)
-    caption = "Cover page ready. DOCX file ta download kore nin."
-    with output_path.open("rb") as document_file:
-        await update.message.reply_document(document=document_file, filename=output_path.name, caption=caption)
+    data = dict(context.user_data)
+    missing = [field for field, _ in FIELDS if not data.get(field)]
+    if missing:
+        context.user_data["field_index"] = 0
+        await send_tracked(update, context, "Kichu input missing. Notun kore first step theke shuru korun.", FORM_KEYBOARD)
+        return ASK_FIELD
 
-    await update.message.reply_text("Abar generate korte chaile menu theke choose korun.", reply_markup=MENU_KEYBOARD)
-    context.user_data.clear()
+    output_path = create_cover_page(data, logo_path)
+    with output_path.open("rb") as document_file:
+        sent_doc = await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=document_file,
+            filename=output_path.name,
+            caption="Cover page ready. DOCX file ta download kore nin.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+    remember_message(context, sent_doc.message_id)
+    reset_form(context)
+    await send_tracked(update, context, "Abar generate korte chaile menu theke choose korun.", MAIN_KEYBOARD)
     return ConversationHandler.END
 
 
 async def ask_logo_again(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Logo hisebe ekta image upload korun, tarpor DOCX generate hobe.")
+    await track_incoming(update, context)
+    await send_tracked(update, context, "Logo image upload korun, ba Back diye submission date edit korun.", FORM_KEYBOARD)
     return ASK_LOGO
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    await update.message.reply_text("Generation cancel kora hoyeche.", reply_markup=MENU_KEYBOARD)
-    return ConversationHandler.END
-
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Menu theke Lab Report Generator ba Assignment Generator choose korun. "
-        "Tarpor bot step by step info and logo nibe."
+    await track_incoming(update, context)
+    await send_tracked(
+        update,
+        context,
+        "Menu theke generator choose korun. Protiti step-e Back/Clear ache. Clear old bot messages delete korar try korbe.",
+        MAIN_KEYBOARD,
     )
 
 
@@ -332,11 +562,19 @@ def build_application() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     conversation = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.Regex("^(Lab Report Generator|Assignment Generator)$"), choose_type),
+            MessageHandler(filters.Regex(f"^({re.escape(LAB_BUTTON)}|{re.escape(ASSIGNMENT_BUTTON)})$"), choose_type),
         ],
         states={
-            ASK_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, collect_field)],
+            ASK_FIELD: [
+                MessageHandler(filters.Regex(f"^{re.escape(BACK_BUTTON)}$"), back_field),
+                MessageHandler(filters.Regex(f"^{re.escape(CLEAR_BUTTON)}$"), clear),
+                MessageHandler(filters.Regex(f"^{re.escape(CANCEL_BUTTON)}$"), cancel),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, collect_field),
+            ],
             ASK_LOGO: [
+                MessageHandler(filters.Regex(f"^{re.escape(BACK_BUTTON)}$"), back_from_logo),
+                MessageHandler(filters.Regex(f"^{re.escape(CLEAR_BUTTON)}$"), clear),
+                MessageHandler(filters.Regex(f"^{re.escape(CANCEL_BUTTON)}$"), cancel),
                 MessageHandler((filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, collect_logo),
                 MessageHandler(filters.ALL & ~filters.COMMAND, ask_logo_again),
             ],
@@ -344,13 +582,16 @@ def build_application() -> Application:
         fallbacks=[
             CommandHandler("start", start),
             CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex(f"^{re.escape(CLEAR_BUTTON)}$"), clear),
         ],
+        allow_reentry=True,
     )
 
+    app.add_handler(conversation)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(conversation)
+    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CLEAR_BUTTON)}$"), clear))
     return app
 
 
