@@ -16,7 +16,7 @@ from reportlab.lib.colors import HexColor
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
-from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram import BotCommand, KeyboardButton, MenuButtonCommands, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -52,6 +52,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
     one_time_keyboard=False,
+    is_persistent=True,
 )
 
 FORM_KEYBOARD = ReplyKeyboardMarkup(
@@ -61,6 +62,7 @@ FORM_KEYBOARD = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
     one_time_keyboard=False,
+    is_persistent=True,
 )
 
 FIELDS = [
@@ -71,7 +73,7 @@ FIELDS = [
     ("student_name", "Student er name likhun:"),
     ("student_id", "Student ID likhun:"),
     ("program", "Program likhun:"),
-    ("batch_year_semester", "Batch / year / semester likhun:"),
+    ("batch_year_semester", "Batch Year Semester likhun, example: 1st Batch 2nd Year 2nd Semester"),
     ("teacher_name", "Teacher er name likhun:"),
     ("teacher_designation", "Teacher er designation likhun:"),
     ("teacher_department", "Teacher er department likhun:"),
@@ -79,6 +81,7 @@ FIELDS = [
 ]
 
 ASK_FIELD, ASK_LOGO = range(2)
+ORDINAL_PATTERN = re.compile(r"(?i)(\d+)(st|nd|rd|th)\b")
 
 
 def clean_filename(value: str) -> str:
@@ -86,15 +89,72 @@ def clean_filename(value: str) -> str:
     return value[:70] or "cover-page"
 
 
+def fit_pdf_text(pdf: canvas.Canvas, text: str, font: str, size: int, max_width: float | None) -> str:
+    if not max_width or pdf.stringWidth(text, font, size) <= max_width:
+        return text
+
+    suffix = "..."
+    fitted = text
+    while fitted and pdf.stringWidth(f"{fitted}{suffix}", font, size) > max_width:
+        fitted = fitted[:-1].rstrip()
+    return f"{fitted}{suffix}" if fitted else suffix
+
+
+def draw_pdf_text_with_ordinals(
+    pdf: canvas.Canvas,
+    text: str,
+    x: float,
+    y: float,
+    size: int,
+    color,
+    font: str = "Helvetica-Bold",
+    max_width: float | None = None,
+) -> None:
+    text = fit_pdf_text(pdf, text, font, size, max_width)
+    cursor_x = x
+    position = 0
+    superscript_size = max(7, int(size * 0.62))
+    superscript_y = y + (size * 0.36)
+
+    pdf.setFillColor(color)
+    for match in ORDINAL_PATTERN.finditer(text):
+        prefix = text[position : match.start()]
+        number, suffix = match.groups()
+
+        if prefix:
+            pdf.setFont(font, size)
+            pdf.drawString(cursor_x, y, prefix)
+            cursor_x += pdf.stringWidth(prefix, font, size)
+
+        pdf.setFont(font, size)
+        pdf.drawString(cursor_x, y, number)
+        cursor_x += pdf.stringWidth(number, font, size)
+
+        pdf.setFont(font, superscript_size)
+        pdf.drawString(cursor_x, superscript_y, suffix.lower())
+        cursor_x += pdf.stringWidth(suffix.lower(), font, superscript_size)
+        position = match.end()
+
+    trailing = text[position:]
+    if trailing:
+        pdf.setFont(font, size)
+        pdf.drawString(cursor_x, y, trailing)
+
+
 def remember_message(context: ContextTypes.DEFAULT_TYPE, message_id: int | None) -> None:
     if not message_id:
         return
+    first_id = context.chat_data.get("first_message_id")
+    if first_id is None or message_id < first_id:
+        context.chat_data["first_message_id"] = message_id
     ids = context.chat_data.setdefault("message_ids", [])
     if message_id not in ids:
         ids.append(message_id)
 
 
 async def send_tracked(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await asyncio.sleep(0.35)
     message = await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=text,
@@ -111,9 +171,16 @@ async def track_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def delete_tracked_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    message_ids = list(context.chat_data.get("message_ids", []))
+    message_ids = set(context.chat_data.get("message_ids", []))
+    first_id = context.chat_data.get("first_message_id")
+    current_id = update.effective_message.message_id if update.effective_message else None
+    if first_id and current_id and current_id >= first_id:
+        message_ids.update(range(first_id, current_id + 1))
+
     context.chat_data["message_ids"] = []
-    for message_id in message_ids:
+    context.chat_data.pop("first_message_id", None)
+
+    for message_id in sorted(message_ids, reverse=True):
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
         except TelegramError:
@@ -374,23 +441,32 @@ def create_cover_page(data: dict, logo_path: Path | None) -> Path:
         pdf.setFillColor(color)
         pdf.drawCentredString(page_width / 2, y, text)
 
-    center_text(data["university_name"].upper(), 775, 20, green, max_width=page_width - 90)
+    center_text(data["university_name"].upper(), 778, 28, green, max_width=page_width - 70)
 
     if logo_path and logo_path.exists():
         try:
             image = ImageReader(str(logo_path))
-            pdf.drawImage(image, (page_width - 82) / 2, 675, width=82, height=82, preserveAspectRatio=True, mask="auto")
+            logo_size = 112
+            pdf.drawImage(
+                image,
+                (page_width - logo_size) / 2,
+                646,
+                width=logo_size,
+                height=logo_size,
+                preserveAspectRatio=True,
+                mask="auto",
+            )
         except Exception:
             LOGGER.exception("Could not insert uploaded logo into PDF")
 
-    center_text(title, 620, 32, teal)
-    center_text(f"{title.title()} No: {data['work_no']}", 588, 18, dark, max_width=page_width - 120)
+    center_text(title, 603, 32, teal)
+    center_text(f"{title.title()} No: {data['work_no']}", 571, 18, dark, max_width=page_width - 120)
 
-    center_text(f"COURSE CODE: {data['course_code']}", 546, 16, dark, max_width=page_width - 120)
-    center_text(f"COURSE TITLE: {data['course_title']}", 520, 16, dark, max_width=page_width - 120)
+    center_text(f"COURSE CODE: {data['course_code']}", 532, 16, dark, max_width=page_width - 120)
+    center_text(f"COURSE TITLE: {data['course_title']}", 506, 16, dark, max_width=page_width - 120)
     pdf.setStrokeColor(teal)
     pdf.setLineWidth(1.6)
-    pdf.line(95, 500, page_width - 95, 500)
+    pdf.line(95, 488, page_width - 95, 488)
 
     box_width = 250
     box_height = 190
@@ -422,8 +498,16 @@ def create_cover_page(data: dict, logo_path: Path | None) -> Path:
                 value_x = x + 20
 
             pdf.setFillColor(dark)
-            pdf.setFont("Helvetica-Bold", 13)
-            pdf.drawString(value_x, y, value[:32])
+            draw_pdf_text_with_ordinals(
+                pdf,
+                value,
+                value_x,
+                y,
+                13,
+                dark,
+                "Helvetica-Bold",
+                max_width=(x + box_width - 20) - value_x,
+            )
             y -= 31
 
     draw_box(
@@ -480,6 +564,8 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await track_incoming(update, context)
     reset_form(context)
     await delete_tracked_messages(update, context)
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await asyncio.sleep(0.35)
     message = await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text="Cleared. Notun kore start korte menu use korun.",
@@ -622,11 +708,22 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def setup_bot_menu(app: Application) -> None:
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "Restart the bot"),
+            BotCommand("help", "Show help"),
+            BotCommand("cancel", "Cancel current generation"),
+        ]
+    )
+    await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+
+
 def build_application() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN environment variable missing.")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(setup_bot_menu).build()
     conversation = ConversationHandler(
         entry_points=[
             MessageHandler(filters.Regex(f"^({re.escape(LAB_BUTTON)}|{re.escape(ASSIGNMENT_BUTTON)})$"), choose_type),
